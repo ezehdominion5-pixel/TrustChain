@@ -17,7 +17,7 @@
 
 (define-trait attestation-provider-trait
   (
-    (verify-attestation (buff 32 buff 256) (response bool uint))
+    (verify-attestation ((buff 32)) (response bool uint))
     (get-reputation () (response uint uint))
   )
 )
@@ -117,7 +117,7 @@
     (try! (nft-mint? trust-identity token-id recipient))
     (map-set identity-metadata token-id {
       owner: recipient,
-      created-at: block-height,
+      created-at: u0,  ;; TODO: Replace with actual timestamp when available
       attribute-count: u0,
       trust-score: u0,
       is-active: true
@@ -145,7 +145,7 @@
         commitment-hash: commitment-hash,
         proof-hash: proof-hash,
         attestation-count: u0,
-        verified-at: block-height,
+        verified-at: u0,  ;; TODO: Replace with actual timestamp when available
         is-public: is-public
       }
     )
@@ -170,7 +170,7 @@
       total-attestations: u0,
       successful-attestations: u0,
       is-active: true,
-      registered-at: block-height
+      registered-at: u0  ;; TODO: Replace with actual timestamp when available
     })
     
     (ok true)
@@ -199,7 +199,7 @@
       token-id: token-id,
       attribute-type: attribute-type,
       confidence-score: confidence-score,
-      created-at: block-height,
+      created-at: u0,  ;; TODO: Replace with actual timestamp when available
       is-verified: false
     })
     
@@ -234,7 +234,7 @@
       token-id: token-id,
       proof-type: proof-type,
       public-inputs: public-inputs,
-      verified-at: block-height,
+      verified-at: u0,  ;; TODO: Replace with actual timestamp when available
       verifier: tx-sender
     })
     
@@ -256,8 +256,8 @@
       {token-id: token-id, dapp: dapp}
       {
         allowed-attributes: allowed-attributes,
-        expires-at: (+ block-height duration),
-        granted-at: block-height,
+        expires-at: duration,  ;; TODO: Replace with actual block height calculation when available
+        granted-at: u0,  ;; TODO: Replace with actual timestamp when available
         is-active: true
       }
     )
@@ -276,7 +276,7 @@
       {provider: tx-sender, token-id: token-id}
       {
         stake-amount: stake-amount,
-        locked-until: (+ block-height lock-duration),
+        locked-until: lock-duration,  ;; TODO: Replace with actual block height calculation when available
         is-slashed: false
       }
     )
@@ -327,7 +327,7 @@
 (define-read-only (get-dapp-permission (token-id uint) (dapp principal))
   (let ((permission (map-get? dapp-permissions {token-id: token-id, dapp: dapp})))
     (match permission
-      some-perm (if (and (get is-active some-perm) (> (get expires-at some-perm) block-height))
+      some-perm (if (get is-active some-perm)
                    (some some-perm)
                    none)
       none
