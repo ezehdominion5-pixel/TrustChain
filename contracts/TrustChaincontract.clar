@@ -300,3 +300,106 @@
     (ok true)
   )
 )
+
+;; read only functions
+
+;; Get identity metadata
+(define-read-only (get-identity (token-id uint))
+  (map-get? identity-metadata token-id)
+)
+
+;; Get attribute data
+(define-read-only (get-attribute (token-id uint) (attribute-type (string-ascii 64)))
+  (map-get? identity-attributes {token-id: token-id, attribute-type: attribute-type})
+)
+
+;; Get provider reputation
+(define-read-only (get-provider-reputation (provider principal))
+  (map-get? attestation-providers provider)
+)
+
+;; Get attestation details
+(define-read-only (get-attestation (attestation-id (buff 32)))
+  (map-get? attestations attestation-id)
+)
+
+;; Check dApp permissions
+(define-read-only (get-dapp-permission (token-id uint) (dapp principal))
+  (let ((permission (map-get? dapp-permissions {token-id: token-id, dapp: dapp})))
+    (match permission
+      some-perm (if (and (get is-active some-perm) (> (get expires-at some-perm) block-height))
+                   (some some-perm)
+                   none)
+      none
+    )
+  )
+)
+
+;; Get ZK proof
+(define-read-only (get-zk-proof (proof-id (buff 32)))
+  (map-get? zk-proofs proof-id)
+)
+
+;; Get token owner
+(define-read-only (get-owner (token-id uint))
+  (ok (nft-get-owner? trust-identity token-id))
+)
+
+;; Get token URI
+(define-read-only (get-token-uri (token-id uint))
+  (ok (some (concat (var-get contract-uri) (int-to-ascii token-id))))
+)
+
+;; Get last token ID
+(define-read-only (get-last-token-id)
+  (ok (var-get token-id-nonce))
+)
+
+;; Calculate trust score based on attestations
+(define-read-only (calculate-trust-score (token-id uint))
+  (let ((identity (map-get? identity-metadata token-id)))
+    (match identity
+      some-identity (ok (* (get attribute-count some-identity) u10)) ;; Simple scoring
+      (ok u0)
+    )
+  )
+)
+
+;; Verify selective disclosure without revealing data
+(define-read-only (verify-selective-disclosure 
+  (token-id uint)
+  (attribute-type (string-ascii 64))
+  (proof-hash (buff 32))
+)
+  (let ((attribute (map-get? identity-attributes {token-id: token-id, attribute-type: attribute-type})))
+    (match attribute
+      some-attr (ok (is-eq (get proof-hash some-attr) proof-hash))
+      (ok false)
+    )
+  )
+)
+
+;; private functions
+
+;; Helper function to validate proof format
+(define-private (is-valid-proof (proof-data (buff 512)))
+  (> (len proof-data) u0)
+)
+
+;; Helper function to calculate reputation adjustment
+(define-private (calculate-reputation-adjustment (success bool) (confidence uint))
+  (if success
+    (/ confidence u10)
+    (- u0 (/ confidence u5))
+  )
+)
+
+;; Helper function to check attribute ownership
+(define-private (check-attribute-ownership (token-id uint) (caller principal))
+  (let ((identity (map-get? identity-metadata token-id)))
+    (match identity
+      some-id (is-eq caller (get owner some-id))
+      false
+    )
+  )
+)
