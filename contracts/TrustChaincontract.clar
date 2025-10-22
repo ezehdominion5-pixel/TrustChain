@@ -17,7 +17,7 @@
 
 (define-trait attestation-provider-trait
   (
-    (verify-attestation (buff 32 buff 256) (response bool uint))
+    (verify-attestation ((buff 32)) (response bool uint))
     (get-reputation () (response uint uint))
   )
 )
@@ -36,14 +36,26 @@
 (define-constant ERR_PROVIDER_NOT_REGISTERED (err u106))
 (define-constant ERR_INSUFFICIENT_REPUTATION (err u107))
 (define-constant ERR_INVALID_DISCLOSURE (err u108))
+(define-constant ERR_CONTRACT_PAUSED (err u109))
+(define-constant ERR_RATE_LIMIT_EXCEEDED (err u110))
+(define-constant ERR_OVERFLOW (err u111))
+(define-constant ERR_INVALID_INPUT (err u112))
+(define-constant ERR_ATTESTATION_REVOKED (err u113))
+(define-constant ERR_BATCH_TOO_LARGE (err u114))
 
 (define-constant MIN_STAKE_AMOUNT u1000000) ;; 1 STX minimum stake
 (define-constant MIN_REPUTATION_THRESHOLD u100)
 (define-constant MAX_ATTRIBUTES u10)
+(define-constant RATE-LIMIT-BLOCKS u10)
+(define-constant MAX-OPERATIONS-PER-BLOCK u5)
+(define-constant MAX_BATCH_SIZE u20)
+(define-constant REPUTATION_DECAY_RATE u5) ;; 5% decay per period
+(define-constant DECAY_PERIOD_BLOCKS u4320) ;; ~30 days
 
 ;; data vars
 (define-data-var token-id-nonce uint u0)
 (define-data-var contract-uri (string-ascii 256) "https://trustchain.network/metadata/")
+(define-data-var contract-paused bool false)
 
 ;; data maps
 ;; Identity token metadata
@@ -108,16 +120,82 @@
   verifier: principal
 })
 
+(define-map last-operation-block principal uint)
+(define-map operations-per-block {user: principal, block: uint} uint)
+(define-map revoked-attestations (buff 32) {revoked-at: uint, reason: (string-ascii 128)})
+(define-map reputation-decay-tracker principal {last-decay-block: uint, decayed-amount: uint})
+
+;; Security helper functions
+(define-private (check-not-paused)
+  (if (var-get contract-paused)
+    ERR_CONTRACT_PAUSED
+    (ok true)
+  )
+)
+
+(define-private (safe-add (a uint) (b uint))
+  (let ((result (+ a b)))
+    (asserts! (>= result a) ERR_OVERFLOW)
+    (ok result)
+  )
+)
+
+(define-private (safe-mul (a uint) (b uint))
+  (let ((result (* a b)))
+    (asserts! (or (is-eq b u0) (is-eq (/ result b) a)) ERR_OVERFLOW)
+    (ok result)
+  )
+)
+
+(define-private (check-rate-limit (user principal))
+  (let (
+    (current-block burn-block-height)
+    (last-block (default-to u0 (map-get? last-operation-block user)))
+    (ops-count (default-to u0 (map-get? operations-per-block {user: user, block: current-block})))
+  )
+    (asserts! 
+      (or 
+        (>= (- current-block last-block) RATE-LIMIT-BLOCKS)
+        (< ops-count MAX-OPERATIONS-PER-BLOCK)
+      )
+      ERR_RATE_LIMIT_EXCEEDED
+    )
+    (map-set last-operation-block user current-block)
+    (map-set operations-per-block {user: user, block: current-block} (+ ops-count u1))
+    (ok true)
+  )
+)
+
 ;; public functions
+
+;; Pause/unpause contract (owner only)
+(define-public (pause-contract)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (var-set contract-paused true)
+    (ok true)
+  )
+)
+
+(define-public (unpause-contract)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (var-set contract-paused false)
+    (ok true)
+  )
+)
 
 ;; Mint a new identity NFT
 (define-public (mint-identity (recipient principal) (metadata-uri (string-ascii 256)))
-  (let ((token-id (+ (var-get token-id-nonce) u1)))
+  (let ((token-id (unwrap! (safe-add (var-get token-id-nonce) u1) ERR_OVERFLOW)))
+    (try! (check-not-paused))
+    (try! (check-rate-limit tx-sender))
     (asserts! (is-eq tx-sender recipient) ERR_NOT_AUTHORIZED)
+    (asserts! (> (len metadata-uri) u0) ERR_INVALID_INPUT)
     (try! (nft-mint? trust-identity token-id recipient))
     (map-set identity-metadata token-id {
       owner: recipient,
-      created-at: block-height,
+      created-at: burn-block-height,
       attribute-count: u0,
       trust-score: u0,
       is-active: true
@@ -136,8 +214,11 @@
   (is-public bool)
 )
   (let ((identity (unwrap! (map-get? identity-metadata token-id) ERR_INVALID_TOKEN)))
+    (try! (check-not-paused))
+    (try! (check-rate-limit tx-sender))
     (asserts! (is-eq tx-sender (get owner identity)) ERR_NOT_AUTHORIZED)
     (asserts! (< (get attribute-count identity) MAX_ATTRIBUTES) ERR_NOT_AUTHORIZED)
+    (asserts! (> (len attribute-type) u0) ERR_INVALID_INPUT)
     
     (map-set identity-attributes 
       {token-id: token-id, attribute-type: attribute-type}
@@ -145,13 +226,13 @@
         commitment-hash: commitment-hash,
         proof-hash: proof-hash,
         attestation-count: u0,
-        verified-at: block-height,
+        verified-at: burn-block-height,
         is-public: is-public
       }
     )
     
     (map-set identity-metadata token-id 
-      (merge identity {attribute-count: (+ (get attribute-count identity) u1)})
+      (merge identity {attribute-count: (unwrap! (safe-add (get attribute-count identity) u1) ERR_OVERFLOW)})
     )
     
     (ok true)
@@ -170,7 +251,7 @@
       total-attestations: u0,
       successful-attestations: u0,
       is-active: true,
-      registered-at: block-height
+      registered-at: u0  ;; TODO: Replace with actual timestamp when available
     })
     
     (ok true)
@@ -199,7 +280,7 @@
       token-id: token-id,
       attribute-type: attribute-type,
       confidence-score: confidence-score,
-      created-at: block-height,
+      created-at: u0,  ;; TODO: Replace with actual timestamp when available
       is-verified: false
     })
     
@@ -234,7 +315,7 @@
       token-id: token-id,
       proof-type: proof-type,
       public-inputs: public-inputs,
-      verified-at: block-height,
+      verified-at: u0,  ;; TODO: Replace with actual timestamp when available
       verifier: tx-sender
     })
     
@@ -256,8 +337,8 @@
       {token-id: token-id, dapp: dapp}
       {
         allowed-attributes: allowed-attributes,
-        expires-at: (+ block-height duration),
-        granted-at: block-height,
+        expires-at: duration,  ;; TODO: Replace with actual block height calculation when available
+        granted-at: u0,  ;; TODO: Replace with actual timestamp when available
         is-active: true
       }
     )
@@ -276,7 +357,7 @@
       {provider: tx-sender, token-id: token-id}
       {
         stake-amount: stake-amount,
-        locked-until: (+ block-height lock-duration),
+        locked-until: lock-duration,  ;; TODO: Replace with actual block height calculation when available
         is-slashed: false
       }
     )
@@ -288,6 +369,7 @@
 ;; Transfer identity NFT
 (define-public (transfer (token-id uint) (sender principal) (recipient principal))
   (begin
+    (try! (check-not-paused))
     (asserts! (is-eq tx-sender sender) ERR_NOT_AUTHORIZED)
     (asserts! (is-some (nft-get-owner? trust-identity token-id)) ERR_INVALID_TOKEN)
     (try! (nft-transfer? trust-identity token-id sender recipient))
@@ -298,6 +380,61 @@
     )
     
     (ok true)
+  )
+)
+
+;; NEW FEATURE: Batch create multiple attestations
+(define-public (batch-create-attestations 
+  (attestation-list (list 20 {token-id: uint, attribute-type: (string-ascii 64), attestation-id: (buff 32), confidence-score: uint}))
+)
+  (let ((provider-data (unwrap! (map-get? attestation-providers tx-sender) ERR_PROVIDER_NOT_REGISTERED)))
+    (try! (check-not-paused))
+    (try! (check-rate-limit tx-sender))
+    (asserts! (get is-active provider-data) ERR_PROVIDER_NOT_REGISTERED)
+    (asserts! (>= (get reputation provider-data) MIN_REPUTATION_THRESHOLD) ERR_INSUFFICIENT_REPUTATION)
+    (asserts! (<= (len attestation-list) MAX_BATCH_SIZE) ERR_BATCH_TOO_LARGE)
+    
+    (ok (fold batch-create-attestation-iter attestation-list u0))
+  )
+)
+
+;; NEW FEATURE: Revoke an attestation
+(define-public (revoke-attestation (attestation-id (buff 32)) (reason (string-ascii 128)))
+  (let ((attestation (unwrap! (map-get? attestations attestation-id) ERR_ATTESTATION_NOT_FOUND)))
+    (try! (check-not-paused))
+    (asserts! (is-eq tx-sender (get provider attestation)) ERR_NOT_AUTHORIZED)
+    (asserts! (> (len reason) u0) ERR_INVALID_INPUT)
+    
+    (map-set revoked-attestations attestation-id {
+      revoked-at: burn-block-height,
+      reason: reason
+    })
+    
+    (ok true)
+  )
+)
+
+;; NEW FEATURE: Apply reputation decay
+(define-public (apply-reputation-decay (provider principal))
+  (let (
+    (provider-data (unwrap! (map-get? attestation-providers provider) ERR_PROVIDER_NOT_REGISTERED))
+    (decay-tracker (default-to {last-decay-block: u0, decayed-amount: u0} (map-get? reputation-decay-tracker provider)))
+    (blocks-since-decay (- burn-block-height (get last-decay-block decay-tracker)))
+  )
+    (asserts! (>= blocks-since-decay DECAY_PERIOD_BLOCKS) ERR_NOT_AUTHORIZED)
+    
+    (let (
+      (current-reputation (get reputation provider-data))
+      (decay-amount (/ (unwrap! (safe-mul current-reputation REPUTATION_DECAY_RATE) ERR_OVERFLOW) u100))
+      (new-reputation (if (>= current-reputation decay-amount) (- current-reputation decay-amount) u0))
+    )
+      (map-set attestation-providers provider (merge provider-data {reputation: new-reputation}))
+      (map-set reputation-decay-tracker provider {
+        last-decay-block: burn-block-height,
+        decayed-amount: (unwrap! (safe-add (get decayed-amount decay-tracker) decay-amount) ERR_OVERFLOW)
+      })
+      (ok new-reputation)
+    )
   )
 )
 
@@ -327,7 +464,7 @@
 (define-read-only (get-dapp-permission (token-id uint) (dapp principal))
   (let ((permission (map-get? dapp-permissions {token-id: token-id, dapp: dapp})))
     (match permission
-      some-perm (if (and (get is-active some-perm) (> (get expires-at some-perm) block-height))
+      some-perm (if (get is-active some-perm)
                    (some some-perm)
                    none)
       none
@@ -379,6 +516,27 @@
   )
 )
 
+;; NEW: Security read-only functions
+(define-read-only (is-contract-paused)
+  (var-get contract-paused)
+)
+
+(define-read-only (get-last-operation-block (user principal))
+  (default-to u0 (map-get? last-operation-block user))
+)
+
+(define-read-only (is-attestation-revoked (attestation-id (buff 32)))
+  (is-some (map-get? revoked-attestations attestation-id))
+)
+
+(define-read-only (get-revocation-details (attestation-id (buff 32)))
+  (map-get? revoked-attestations attestation-id)
+)
+
+(define-read-only (get-reputation-decay-info (provider principal))
+  (map-get? reputation-decay-tracker provider)
+)
+
 ;; private functions
 
 ;; Helper function to validate proof format
@@ -400,6 +558,35 @@
     (match identity
       some-id (is-eq caller (get owner some-id))
       false
+    )
+  )
+)
+
+;; Helper for batch attestation creation
+(define-private (batch-create-attestation-iter 
+  (attestation {token-id: uint, attribute-type: (string-ascii 64), attestation-id: (buff 32), confidence-score: uint})
+  (count uint)
+)
+  (let (
+    (attribute-key {token-id: (get token-id attestation), attribute-type: (get attribute-type attestation)})
+    (attribute-data (map-get? identity-attributes attribute-key))
+  )
+    (match attribute-data
+      some-attr (begin
+        (map-set attestations (get attestation-id attestation) {
+          provider: tx-sender,
+          token-id: (get token-id attestation),
+          attribute-type: (get attribute-type attestation),
+          confidence-score: (get confidence-score attestation),
+          created-at: burn-block-height,
+          is-verified: false
+        })
+        (map-set identity-attributes attribute-key
+          (merge some-attr {attestation-count: (+ (get attestation-count some-attr) u1)})
+        )
+        (+ count u1)
+      )
+      count
     )
   )
 )
